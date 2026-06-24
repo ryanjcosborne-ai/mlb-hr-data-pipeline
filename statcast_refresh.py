@@ -4,7 +4,8 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from pybaseball import batting_stats, pitching_stats, statcast
+import requests
+from pybaseball import statcast
 
 
 TIMEZONE = ZoneInfo("America/Toronto")
@@ -20,7 +21,7 @@ def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def clean_value(value):
+def safe_number(value):
     if value is None:
         return ""
     try:
@@ -33,146 +34,10 @@ def clean_value(value):
     return value
 
 
-def normalize_percent(value):
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-
-    if isinstance(value, str):
-        value = value.replace("%", "").strip()
-        if value == "":
-            return ""
-        try:
-            return float(value) / 100
-        except ValueError:
-            return ""
-
-    try:
-        value = float(value)
-    except Exception:
-        return ""
-
-    if value > 1:
-        return value / 100
-
-    return value
-
-
-def pick(row, names, default=""):
-    for name in names:
-        if name in row.index:
-            return clean_value(row[name])
-    return default
-
-
-def pick_percent(row, names, default=""):
-    return normalize_percent(pick(row, names, default))
-
-
 def write_csv(filename, df):
     path = os.path.join(DATA_DIR, filename)
     df.to_csv(path, index=False)
     print(f"Wrote {len(df)} rows to {path}")
-
-
-def pull_batter_daily():
-    print("Pulling season-to-date batter data...")
-    source = batting_stats(SEASON, qual=0)
-    pull_ts = now_str()
-
-    rows = []
-
-    for _, row in source.iterrows():
-        pa = pick(row, ["PA"])
-        barrels = pick(row, ["Barrels"])
-        barrel_per_pa = ""
-
-        try:
-            if pa != "" and float(pa) > 0 and barrels != "":
-                barrel_per_pa = float(barrels) / float(pa)
-        except Exception:
-            barrel_per_pa = ""
-
-        rows.append({
-            "pull_timestamp": pull_ts,
-            "season": SEASON,
-            "player_name": pick(row, ["Name"]),
-            "team": pick(row, ["Team"]),
-            "mlbam_id": "",
-            "pa": pa,
-            "batted_balls": pick(row, ["Events", "Batted Balls", "BBE"]),
-            "hr": pick(row, ["HR"]),
-            "xslg": pick(row, ["xSLG", "xSLG+"]),
-            "xwoba": pick(row, ["xwOBA", "xWOBA"]),
-            "xba": pick(row, ["xBA"]),
-            "avg_ev": pick(row, ["EV", "Avg EV", "avgEV"]),
-            "max_ev": pick(row, ["maxEV", "Max EV"]),
-            "hard_hit_pct": pick_percent(row, ["HardHit%", "Hard Hit %", "HardHit%"]),
-            "barrels": barrels,
-            "barrel_pct": pick_percent(row, ["Barrel%", "Barrel %"]),
-            "barrel_per_pa": barrel_per_pa,
-            "avg_launch_angle": pick(row, ["LA", "Launch Angle", "avgLA"]),
-            "sweet_spot_pct": pick_percent(row, ["SweetSpot%", "Sweet Spot %"]),
-            "fb_pct": pick_percent(row, ["FB%", "FB %"]),
-            "pull_pct": pick_percent(row, ["Pull%", "Pull %"]),
-            "hr_per_fb": pick_percent(row, ["HR/FB", "HR/FB%"]),
-            "source": "pybaseball.batting_stats",
-            "notes": "",
-        })
-
-    return pd.DataFrame(rows)
-
-
-def pull_pitcher_daily():
-    print("Pulling season-to-date pitcher data...")
-    source = pitching_stats(SEASON, qual=0)
-    pull_ts = now_str()
-
-    rows = []
-
-    for _, row in source.iterrows():
-        bf = pick(row, ["TBF", "BF"])
-        barrels = pick(row, ["Barrels"])
-        barrel_per_pa = ""
-
-        try:
-            if bf != "" and float(bf) > 0 and barrels != "":
-                barrel_per_pa = float(barrels) / float(bf)
-        except Exception:
-            barrel_per_pa = ""
-
-        rows.append({
-            "pull_timestamp": pull_ts,
-            "season": SEASON,
-            "player_name": pick(row, ["Name"]),
-            "team": pick(row, ["Team"]),
-            "mlbam_id": "",
-            "batters_faced": bf,
-            "batted_balls_allowed": pick(row, ["Events", "Batted Balls", "BBE"]),
-            "hr_allowed": pick(row, ["HR"]),
-            "xera": pick(row, ["xERA"]),
-            "xslg_allowed": pick(row, ["xSLG", "xSLG+"]),
-            "xwoba_allowed": pick(row, ["xwOBA", "xWOBA"]),
-            "avg_ev_allowed": pick(row, ["EV", "Avg EV", "avgEV"]),
-            "max_ev_allowed": pick(row, ["maxEV", "Max EV"]),
-            "hard_hit_pct_allowed": pick_percent(row, ["HardHit%", "Hard Hit %", "HardHit%"]),
-            "barrels_allowed": barrels,
-            "barrel_pct_allowed": pick_percent(row, ["Barrel%", "Barrel %"]),
-            "barrel_per_pa_allowed": barrel_per_pa,
-            "avg_launch_angle_allowed": pick(row, ["LA", "Launch Angle", "avgLA"]),
-            "fb_pct_allowed": pick_percent(row, ["FB%", "FB %"]),
-            "pull_pct_allowed": pick_percent(row, ["Pull%", "Pull %"]),
-            "hr_per_fb_allowed": pick_percent(row, ["HR/FB", "HR/FB%"]),
-            "pitch_hand": "",
-            "source": "pybaseball.pitching_stats",
-            "notes": "",
-        })
-
-    return pd.DataFrame(rows)
 
 
 def sample_quality(pa_or_bf, bbe):
@@ -183,7 +48,44 @@ def sample_quality(pa_or_bf, bbe):
     return "Thin"
 
 
-def aggregate_window(df, window_days, role):
+def get_people_map(player_ids):
+    player_ids = sorted({int(pid) for pid in player_ids if pd.notna(pid)})
+    people = {}
+
+    for i in range(0, len(player_ids), 100):
+        chunk = player_ids[i:i + 100]
+        response = requests.get(
+            "https://statsapi.mlb.com/api/v1/people",
+            params={"personIds": ",".join(map(str, chunk))},
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        for person in response.json().get("people", []):
+            mlbam_id = person.get("id")
+            people[mlbam_id] = {
+                "name": person.get("fullName", ""),
+                "team": (person.get("currentTeam") or {}).get("abbreviation", ""),
+            }
+
+    return people
+
+
+def pull_statcast_30_days():
+    end_date = datetime.now(TIMEZONE).date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=29)
+
+    print(f"Pulling Statcast data from {start_date} to {end_date}...")
+    df = statcast(start_dt=str(start_date), end_dt=str(end_date), verbose=False)
+
+    if df.empty:
+        raise RuntimeError("Statcast returned no data.")
+
+    print(f"Pulled {len(df)} Statcast rows.")
+    return df
+
+
+def aggregate_player_window(df, window_days, role, people_map):
     pull_ts = now_str()
     end_date = datetime.now(TIMEZONE).date() - timedelta(days=1)
     start_date = end_date - timedelta(days=window_days - 1)
@@ -196,12 +98,15 @@ def aggregate_window(df, window_days, role):
     ]
 
     id_col = "batter" if role == "batter" else "pitcher"
-    pa_rows = window[window["events"].notna()]
-    bbe = window[window["launch_speed"].notna()]
+
+    pa_rows = window[window["events"].notna()].copy()
+    bbe = window[window["launch_speed"].notna()].copy()
 
     rows = []
 
     for mlbam_id, group in pa_rows.groupby(id_col):
+        mlbam_id = int(mlbam_id)
+        people = people_map.get(mlbam_id, {})
         bbe_group = bbe[bbe[id_col] == mlbam_id]
 
         pa_or_bf = len(group)
@@ -210,16 +115,34 @@ def aggregate_window(df, window_days, role):
 
         avg_ev = bbe_group["launch_speed"].mean() if batted_balls else ""
         max_ev = bbe_group["launch_speed"].max() if batted_balls else ""
-        hard_hit = int((bbe_group["launch_speed"] >= 95).sum()) if batted_balls else ""
-        hard_hit_pct = hard_hit / batted_balls if batted_balls else ""
+
+        hard_hit_count = (
+            int((bbe_group["launch_speed"] >= 95).sum())
+            if batted_balls
+            else ""
+        )
+        hard_hit_pct = (
+            hard_hit_count / batted_balls
+            if batted_balls and hard_hit_count != ""
+            else ""
+        )
 
         if "launch_speed_angle" in bbe_group.columns and batted_balls:
             barrels = int((bbe_group["launch_speed_angle"] == 6).sum())
         else:
             barrels = ""
 
-        barrel_pct = barrels / batted_balls if batted_balls and barrels != "" else ""
-        barrel_per_pa = barrels / pa_or_bf if pa_or_bf and barrels != "" else ""
+        barrel_pct = (
+            barrels / batted_balls
+            if batted_balls and barrels != ""
+            else ""
+        )
+
+        barrel_per_pa = (
+            barrels / pa_or_bf
+            if pa_or_bf and barrels != ""
+            else ""
+        )
 
         xwoba = (
             bbe_group["estimated_woba_using_speedangle"].mean()
@@ -227,97 +150,205 @@ def aggregate_window(df, window_days, role):
             else ""
         )
 
-        avg_la = bbe_group["launch_angle"].mean() if batted_balls else ""
-
-        fb_pct = (
-            (bbe_group["bb_type"] == "fly_ball").sum() / batted_balls
-            if batted_balls and "bb_type" in bbe_group.columns
+        avg_launch_angle = (
+            bbe_group["launch_angle"].mean()
+            if batted_balls
             else ""
         )
 
-        player_name = ""
-        team = ""
+        fly_balls = (
+            int((bbe_group["bb_type"] == "fly_ball").sum())
+            if "bb_type" in bbe_group.columns and batted_balls
+            else 0
+        )
 
-        if role == "batter":
-            player_rows = group[group["player_name"].notna()]
-            if len(player_rows):
-                player_name = player_rows.iloc[0]["player_name"]
-            if "home_team" in group.columns and "away_team" in group.columns:
-                team = ""
-        else:
-            player_name = ""
+        fb_pct = fly_balls / batted_balls if batted_balls else ""
+        hr_per_fb = hr / fly_balls if fly_balls else ""
 
         rows.append({
             "pull_timestamp": pull_ts,
             "window_days": window_days,
-            "player_name": player_name,
-            "team": team,
-            "mlbam_id": int(mlbam_id),
+            "player_name": people.get("name", ""),
+            "team": people.get("team", ""),
+            "mlbam_id": mlbam_id,
             "role": role,
             "pa_or_bf": pa_or_bf,
             "batted_balls": batted_balls,
             "hr": hr,
-            "avg_ev": avg_ev,
-            "max_ev": max_ev,
-            "hard_hit_pct": hard_hit_pct,
+            "avg_ev": safe_number(avg_ev),
+            "max_ev": safe_number(max_ev),
+            "hard_hit_pct": safe_number(hard_hit_pct),
             "barrels": barrels,
-            "barrel_pct": barrel_pct,
-            "barrel_per_pa": barrel_per_pa,
+            "barrel_pct": safe_number(barrel_pct),
+            "barrel_per_pa": safe_number(barrel_per_pa),
             "xslg": "",
-            "xwoba": xwoba,
-            "avg_launch_angle": avg_la,
-            "fb_pct": fb_pct,
+            "xwoba": safe_number(xwoba),
+            "avg_launch_angle": safe_number(avg_launch_angle),
+            "fb_pct": safe_number(fb_pct),
             "pull_pct": "",
             "sample_quality": sample_quality(pa_or_bf, batted_balls),
             "source": "pybaseball.statcast",
-            "notes": "",
+            "notes": "Rolling Statcast sample; no FanGraphs dependency.",
             "reserved_1": "",
             "reserved_2": "",
             "reserved_3": "",
             "reserved_4": "",
             "reserved_5": "",
+            "hr_per_fb": safe_number(hr_per_fb),
         })
 
     return rows
 
 
-def pull_rolling_windows():
-    pull_ts = now_str()
-    end_date = datetime.now(TIMEZONE).date() - timedelta(days=1)
-    start_date = end_date - timedelta(days=29)
-
-    print(f"Pulling 30-day Statcast data from {start_date} to {end_date}...")
-    df = statcast(start_dt=str(start_date), end_dt=str(end_date), verbose=False)
-
-    if df.empty:
-        print("Statcast returned no rows.")
-        return pd.DataFrame()
-
+def build_rolling_windows(df, people_map):
     rows = []
 
     for window_days in [7, 14, 30]:
-        rows.extend(aggregate_window(df, window_days, "batter"))
-        rows.extend(aggregate_window(df, window_days, "pitcher"))
+        rows.extend(aggregate_player_window(df, window_days, "batter", people_map))
+        rows.extend(aggregate_player_window(df, window_days, "pitcher", people_map))
+
+    rolling_df = pd.DataFrame(rows)
+
+    rolling_headers = [
+        "pull_timestamp",
+        "window_days",
+        "player_name",
+        "team",
+        "mlbam_id",
+        "role",
+        "pa_or_bf",
+        "batted_balls",
+        "hr",
+        "avg_ev",
+        "max_ev",
+        "hard_hit_pct",
+        "barrels",
+        "barrel_pct",
+        "barrel_per_pa",
+        "xslg",
+        "xwoba",
+        "avg_launch_angle",
+        "fb_pct",
+        "pull_pct",
+        "sample_quality",
+        "source",
+        "notes",
+        "reserved_1",
+        "reserved_2",
+        "reserved_3",
+        "reserved_4",
+        "reserved_5",
+        "hr_per_fb",
+    ]
+
+    return rolling_df[rolling_headers]
+
+
+def build_batter_daily_from_rolling(rolling_df):
+    batter_30 = rolling_df[
+        (rolling_df["role"] == "batter") &
+        (rolling_df["window_days"] == 30)
+    ].copy()
+
+    rows = []
+
+    for _, row in batter_30.iterrows():
+        rows.append({
+            "pull_timestamp": row["pull_timestamp"],
+            "season": SEASON,
+            "player_name": row["player_name"],
+            "team": row["team"],
+            "mlbam_id": row["mlbam_id"],
+            "pa": row["pa_or_bf"],
+            "batted_balls": row["batted_balls"],
+            "hr": row["hr"],
+            "xslg": "",
+            "xwoba": row["xwoba"],
+            "xba": "",
+            "avg_ev": row["avg_ev"],
+            "max_ev": row["max_ev"],
+            "hard_hit_pct": row["hard_hit_pct"],
+            "barrels": row["barrels"],
+            "barrel_pct": row["barrel_pct"],
+            "barrel_per_pa": row["barrel_per_pa"],
+            "avg_launch_angle": row["avg_launch_angle"],
+            "sweet_spot_pct": "",
+            "fb_pct": row["fb_pct"],
+            "pull_pct": "",
+            "hr_per_fb": row["hr_per_fb"],
+            "source": "pybaseball.statcast rolling_30",
+            "notes": "30-day Statcast rolling proxy; FanGraphs blocked on GitHub runner.",
+        })
 
     return pd.DataFrame(rows)
 
 
-def main():
-    ensure_data_dir()
+def build_pitcher_daily_from_rolling(rolling_df):
+    pitcher_30 = rolling_df[
+        (rolling_df["role"] == "pitcher") &
+        (rolling_df["window_days"] == 30)
+    ].copy()
 
-    batter_df = pull_batter_daily()
-    pitcher_df = pull_pitcher_daily()
-    rolling_df = pull_rolling_windows()
+    rows = []
 
-    status_df = pd.DataFrame([{
+    for _, row in pitcher_30.iterrows():
+        rows.append({
+            "pull_timestamp": row["pull_timestamp"],
+            "season": SEASON,
+            "player_name": row["player_name"],
+            "team": row["team"],
+            "mlbam_id": row["mlbam_id"],
+            "batters_faced": row["pa_or_bf"],
+            "batted_balls_allowed": row["batted_balls"],
+            "hr_allowed": row["hr"],
+            "xera": "",
+            "xslg_allowed": "",
+            "xwoba_allowed": row["xwoba"],
+            "avg_ev_allowed": row["avg_ev"],
+            "max_ev_allowed": row["max_ev"],
+            "hard_hit_pct_allowed": row["hard_hit_pct"],
+            "barrels_allowed": row["barrels"],
+            "barrel_pct_allowed": row["barrel_pct"],
+            "barrel_per_pa_allowed": row["barrel_per_pa"],
+            "avg_launch_angle_allowed": row["avg_launch_angle"],
+            "fb_pct_allowed": row["fb_pct"],
+            "pull_pct_allowed": "",
+            "hr_per_fb_allowed": row["hr_per_fb"],
+            "pitch_hand": "",
+            "source": "pybaseball.statcast rolling_30",
+            "notes": "30-day Statcast rolling proxy; FanGraphs blocked on GitHub runner.",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_status_df(batter_df, pitcher_df, rolling_df):
+    return pd.DataFrame([{
         "pull_timestamp": now_str(),
         "season": SEASON,
         "batter_rows": len(batter_df),
         "pitcher_rows": len(pitcher_df),
         "rolling_rows": len(rolling_df),
         "status": "OK",
-        "notes": "Generated by GitHub Actions. To be imported into Google Sheets by Apps Script."
+        "notes": "Statcast-only pipeline completed. No Google Cloud. No FanGraphs.",
     }])
+
+
+def main():
+    ensure_data_dir()
+
+    statcast_df = pull_statcast_30_days()
+
+    player_ids = set(statcast_df["batter"].dropna().astype(int).unique())
+    player_ids.update(set(statcast_df["pitcher"].dropna().astype(int).unique()))
+
+    print(f"Fetching MLB people metadata for {len(player_ids)} players...")
+    people_map = get_people_map(player_ids)
+
+    rolling_df = build_rolling_windows(statcast_df, people_map)
+    batter_df = build_batter_daily_from_rolling(rolling_df)
+    pitcher_df = build_pitcher_daily_from_rolling(rolling_df)
+    status_df = build_status_df(batter_df, pitcher_df, rolling_df)
 
     write_csv("batter_statcast_daily.csv", batter_df)
     write_csv("pitcher_statcast_daily.csv", pitcher_df)
