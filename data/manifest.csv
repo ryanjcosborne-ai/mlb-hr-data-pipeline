@@ -1,0 +1,6 @@
+sheet_name,url,date_column,required,import_mode
+Statcast Rolling Windows,https://raw.githubusercontent.com/ryanjcosborne-ai/mlb-hr-data-pipeline/main/data/statcast_batter_rolling.csv,pull_timestamp,TRUE,replace
+Pitcher Statcast Rolling,https://raw.githubusercontent.com/ryanjcosborne-ai/mlb-hr-data-pipeline/main/data/statcast_pitcher_rolling.csv,pull_timestamp,TRUE,replace
+Pitch Type Batter Damage,https://raw.githubusercontent.com/ryanjcosborne-ai/mlb-hr-data-pipeline/main/data/pitch_type_batter_damage.csv,pull_timestamp,TRUE,replace
+Pitch Type Pitcher Vulnerability,https://raw.githubusercontent.com/ryanjcosborne-ai/mlb-hr-data-pipeline/main/data/pitch_type_pitcher_vulnerability.csv,pull_timestamp,TRUE,replace
+Bullpen HR Vulnerability,https://raw.githubusercontent.com/ryanjcosborne-ai/mlb-hr-data-pipeline/main/data/bullpen_hr_vulnerability.csv,pull_timestamp,FALSE,replace
