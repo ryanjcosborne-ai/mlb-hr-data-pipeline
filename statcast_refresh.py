@@ -1,361 +1,476 @@
+#!/usr/bin/env python3
+"""
+MLB HR Prop Predictor — Phase 3 Statcast Feature Refresh
+
+Output CSVs for Apps Script import:
+- statcast_batter_rolling.csv
+- statcast_pitcher_rolling.csv
+- pitch_type_batter_damage.csv
+- pitch_type_pitcher_vulnerability.csv
+- bullpen_hr_vulnerability.csv
+- manifest.csv
+- refresh_summary.json
+
+Env:
+- RAW_BASE_URL = https://raw.githubusercontent.com/OWNER/REPO/main/data/exports
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import os
-from datetime import datetime, timedelta
+import sys
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
-from pybaseball import statcast
+
+from pybaseball import playerid_reverse_lookup, statcast
 
 
-TIMEZONE = ZoneInfo("America/Toronto")
-SEASON = datetime.now(TIMEZONE).year
-DATA_DIR = "data"
+@dataclass
+class Config:
+    slate_date: date
+    timezone: str
+    output_dir: Path
+    raw_base_url: str
+    windows: tuple[int, ...]
+    lookback_days: int
 
 
-def now_str() -> str:
-    return datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+def now_iso(tz: str) -> str:
+    return datetime.now(ZoneInfo(tz)).isoformat(timespec="seconds")
 
 
-def ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
+def parse_date(value: str, tz: str) -> date:
+    if value.lower() == "today":
+        return datetime.now(ZoneInfo(tz)).date()
+    return datetime.strptime(value, "%Y-%m-%d").date()
 
 
-def safe_number(value):
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    if isinstance(value, (np.integer, np.floating)):
-        return float(value)
-    return value
-
-
-def write_csv(filename, df):
-    path = os.path.join(DATA_DIR, filename)
+def write_csv(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
-    print(f"Wrote {len(df)} rows to {path}")
 
 
-def sample_quality(pa_or_bf, bbe):
-    if pa_or_bf >= 40 and bbe >= 25:
-        return "Good"
-    if pa_or_bf >= 20 and bbe >= 10:
-        return "Medium"
-    return "Thin"
+def with_stamp(df: pd.DataFrame, cfg: Config, note: str) -> pd.DataFrame:
+    out = df.copy()
+    out["slate_date"] = cfg.slate_date.isoformat()
+    out["pull_timestamp"] = now_iso(cfg.timezone)
+    out["data_notes"] = note
+    return out
 
 
-def get_people_map(player_ids):
-    player_ids = sorted({int(pid) for pid in player_ids if pd.notna(pid)})
-    people = {}
+def most_common(s: pd.Series) -> str:
+    if s is None or len(s) == 0:
+        return ""
+    vc = s.dropna().astype(str)
+    vc = vc[vc.ne("")]
+    return "" if vc.empty else str(vc.value_counts().index[0])
 
-    for i in range(0, len(player_ids), 100):
-        chunk = player_ids[i:i + 100]
-        response = requests.get(
-            "https://statsapi.mlb.com/api/v1/people",
-            params={"personIds": ",".join(map(str, chunk))},
-            timeout=30,
+
+def rate(num: float, den: float, digits: int = 4):
+    return "" if den in (0, "", None) or pd.isna(den) else round(float(num) / float(den), digits)
+
+
+def fetch_statcast_chunks(cfg: Config) -> pd.DataFrame:
+    end = cfg.slate_date - timedelta(days=1)
+    start = cfg.slate_date - timedelta(days=cfg.lookback_days)
+    chunks = []
+    cur = start
+
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=6), end)
+        print(f"Fetching Statcast {cur} to {chunk_end}", flush=True)
+        df = statcast(start_dt=cur.isoformat(), end_dt=chunk_end.isoformat())
+        if df is not None and not df.empty:
+            chunks.append(df)
+        cur = chunk_end + timedelta(days=1)
+        time.sleep(1)
+
+    if not chunks:
+        raise RuntimeError("No Statcast rows returned.")
+    out = pd.concat(chunks, ignore_index=True)
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def add_batter_names(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "batter" not in out.columns:
+        out["batter_name"] = ""
+        return out
+
+    ids = pd.to_numeric(out["batter"], errors="coerce").dropna().astype(int).unique().tolist()
+    out["batter"] = out["batter"].astype(str)
+    out["batter_name"] = ""
+
+    if not ids:
+        return out
+
+    try:
+        lookup = playerid_reverse_lookup(ids, key_type="mlbam")
+        lookup["batter"] = lookup["key_mlbam"].astype(str)
+        lookup["batter_name"] = (
+            lookup["name_first"].fillna("") + " " + lookup["name_last"].fillna("")
+        ).str.strip()
+
+        out = out.drop(columns=["batter_name"]).merge(
+            lookup[["batter", "batter_name"]].drop_duplicates(),
+            on="batter",
+            how="left"
         )
-        response.raise_for_status()
+        out["batter_name"] = out["batter_name"].fillna("")
+    except Exception as exc:
+        print(f"WARNING: playerid_reverse_lookup failed: {exc}", file=sys.stderr)
 
-        for person in response.json().get("people", []):
-            mlbam_id = person.get("id")
-            people[mlbam_id] = {
-                "name": person.get("fullName", ""),
-                "team": (person.get("currentTeam") or {}).get("abbreviation", ""),
-            }
-
-    return people
+    return out
 
 
-def pull_statcast_30_days():
-    end_date = datetime.now(TIMEZONE).date() - timedelta(days=1)
-    start_date = end_date - timedelta(days=29)
+def prepare_statcast(raw: pd.DataFrame) -> pd.DataFrame:
+    df = add_batter_names(raw)
 
-    print(f"Pulling Statcast data from {start_date} to {end_date}...")
-    df = statcast(start_dt=str(start_date), end_dt=str(end_date), verbose=False)
+    for col in ["launch_speed", "launch_angle", "hc_x", "release_speed", "inning"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
 
-    if df.empty:
-        raise RuntimeError("Statcast returned no data.")
+    for col in [
+        "events",
+        "description",
+        "bb_type",
+        "stand",
+        "p_throws",
+        "home_team",
+        "away_team",
+        "inning_topbot",
+        "pitch_type",
+        "pitch_name",
+        "player_name",
+    ]:
+        if col not in df.columns:
+            df[col] = ""
 
-    print(f"Pulled {len(df)} Statcast rows.")
+    df["game_date_dt"] = pd.to_datetime(df["game_date"], errors="coerce").dt.date
+    df["is_pa_event"] = df["events"].notna() & df["events"].astype(str).ne("")
+    df["pa_key"] = (
+        df.get("game_pk", "").astype(str)
+        + "_"
+        + df.get("at_bat_number", "").astype(str)
+        + "_"
+        + df["batter"].astype(str)
+    )
+
+    df["is_bbe"] = df["launch_speed"].notna() & df["launch_angle"].notna()
+    df["is_hr"] = df["events"].astype(str).eq("home_run")
+    df["is_air"] = df["is_bbe"] & (
+        (df["launch_angle"] >= 10)
+        | df["bb_type"].astype(str).isin(["fly_ball", "line_drive", "popup"])
+    )
+    df["is_hard_hit"] = df["is_bbe"] & (df["launch_speed"] >= 95)
+    df["is_hard_air"] = df["is_air"] & (df["launch_speed"] >= 95)
+    df["is_blast"] = (
+        df["is_bbe"]
+        & (df["launch_speed"] >= 100)
+        & (df["launch_angle"].between(20, 35))
+    )
+    df["is_sweet_spot"] = df["is_bbe"] & df["launch_angle"].between(8, 32)
+
+    if "launch_speed_angle" in df.columns:
+        df["is_barrel"] = pd.to_numeric(df["launch_speed_angle"], errors="coerce").eq(6)
+    else:
+        df["is_barrel"] = (
+            df["is_bbe"]
+            & (df["launch_speed"] >= 98)
+            & df["launch_angle"].between(24, 32)
+        )
+
+    # Pull-air proxy from Savant hit coordinates.
+    # Approximation: RHB pull side tends lower hc_x; LHB pull side tends higher hc_x.
+    df["is_pulled_proxy"] = np.where(
+        df["stand"].astype(str).eq("R"),
+        df["hc_x"] < 125,
+        np.where(df["stand"].astype(str).eq("L"), df["hc_x"] > 125, False),
+    )
+    df["is_pulled_air_proxy"] = df["is_air"] & pd.Series(df["is_pulled_proxy"]).fillna(False)
+
+    df["batter_team"] = np.where(
+        df["inning_topbot"].astype(str).eq("Top"),
+        df["away_team"],
+        np.where(df["inning_topbot"].astype(str).eq("Bot"), df["home_team"], ""),
+    )
+    df["pitching_team"] = np.where(
+        df["inning_topbot"].astype(str).eq("Top"),
+        df["home_team"],
+        np.where(df["inning_topbot"].astype(str).eq("Bot"), df["away_team"], ""),
+    )
     return df
 
 
-def aggregate_player_window(df, window_days, role, people_map):
-    pull_ts = now_str()
-    end_date = datetime.now(TIMEZONE).date() - timedelta(days=1)
-    start_date = end_date - timedelta(days=window_days - 1)
+def summarize(g: pd.DataFrame) -> dict:
+    pa = int(g.loc[g["is_pa_event"], "pa_key"].nunique())
+    bbe = int(g["is_bbe"].sum())
+    air = int(g["is_air"].sum())
+    barrels = int(g["is_barrel"].sum())
+    hard_air = int(g["is_hard_air"].sum())
+    blasts = int(g["is_blast"].sum())
+    pulled_air = int(g["is_pulled_air_proxy"].sum())
+    sweet = int(g["is_sweet_spot"].sum())
+    hr = int(g["is_hr"].sum())
 
-    window = df.copy()
-    window["game_date"] = pd.to_datetime(window["game_date"]).dt.date
-    window = window[
-        (window["game_date"] >= start_date) &
-        (window["game_date"] <= end_date)
+    return {
+        "pa": pa,
+        "bbe": bbe,
+        "air_bbe": air,
+        "hr": hr,
+        "barrels": barrels,
+        "hard_air_bbe": hard_air,
+        "blast_bbe": blasts,
+        "pulled_air_proxy_bbe": pulled_air,
+        "sweet_spot_bbe": sweet,
+        "max_ev": round(float(g["launch_speed"].max()), 2) if bbe else "",
+        "avg_ev": round(float(g.loc[g["is_bbe"], "launch_speed"].mean()), 2) if bbe else "",
+        "avg_la": round(float(g.loc[g["is_bbe"], "launch_angle"].mean()), 2) if bbe else "",
+        "hr_per_pa": rate(hr, pa),
+        "barrel_per_pa": rate(barrels, pa),
+        "barrel_per_bbe": rate(barrels, bbe),
+        "hard_air_per_pa": rate(hard_air, pa),
+        "blast_per_pa": rate(blasts, pa),
+        "pulled_air_per_bbe": rate(pulled_air, bbe),
+        "sweet_spot_per_bbe": rate(sweet, bbe),
+    }
+
+
+def batter_rolling(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    rows = []
+    for w in cfg.windows:
+        d = df[df["game_date_dt"] >= cfg.slate_date - timedelta(days=w)]
+        for (bid, name), g in d.groupby(["batter", "batter_name"], dropna=False):
+            rec = {
+                "window_days": w,
+                "batter_id": str(bid),
+                "player": name,
+                "team_recent": most_common(g["batter_team"]),
+                "stand_recent": most_common(g["stand"]),
+            }
+            rec.update(summarize(g))
+            rows.append(rec)
+
+    return with_stamp(
+        pd.DataFrame(rows),
+        cfg,
+        "Batter rolling HR contact-shape metrics from Statcast.",
+    )
+
+
+def pitcher_rolling(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    rows = []
+    for w in cfg.windows:
+        d = df[df["game_date_dt"] >= cfg.slate_date - timedelta(days=w)]
+        for (pid, pname, throws), g in d.groupby(["pitcher", "player_name", "p_throws"], dropna=False):
+            rec = {
+                "window_days": w,
+                "pitcher_id": str(pid),
+                "pitcher": pname,
+                "p_throws": throws,
+                "avg_release_speed": round(float(g["release_speed"].mean()), 2)
+                if g["release_speed"].notna().any()
+                else "",
+            }
+            rec.update(summarize(g))
+            rows.append(rec)
+
+    return with_stamp(
+        pd.DataFrame(rows),
+        cfg,
+        "Pitcher rolling HR/contact vulnerability metrics from Statcast.",
+    )
+
+
+def batter_pitch_type(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    d = df[df["game_date_dt"] >= cfg.slate_date - timedelta(days=max(cfg.windows))]
+    rows = []
+
+    for (bid, name, stand, pitch), g in d.groupby(
+        ["batter", "batter_name", "stand", "pitch_type"], dropna=False
+    ):
+        if not str(pitch).strip() or str(pitch) == "nan":
+            continue
+
+        rec = {
+            "batter_id": str(bid),
+            "player": name,
+            "stand": stand,
+            "pitch_type": pitch,
+            "pitch_name": most_common(g["pitch_name"]),
+        }
+        rec.update(summarize(g))
+        rows.append(rec)
+
+    return with_stamp(pd.DataFrame(rows), cfg, "Batter damage by pitch type.")
+
+
+def pitcher_pitch_type(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    d = df[df["game_date_dt"] >= cfg.slate_date - timedelta(days=max(cfg.windows))]
+
+    total = d.groupby("pitcher").size().rename("total_pitches").reset_index()
+    total["pitcher"] = total["pitcher"].astype(str)
+
+    rows = []
+    for (pid, pname, throws, pitch), g in d.groupby(
+        ["pitcher", "player_name", "p_throws", "pitch_type"], dropna=False
+    ):
+        if not str(pitch).strip() or str(pitch) == "nan":
+            continue
+
+        rec = {
+            "pitcher_id": str(pid),
+            "pitcher": pname,
+            "p_throws": throws,
+            "pitch_type": pitch,
+            "pitch_name": most_common(g["pitch_name"]),
+            "pitch_count": int(len(g)),
+        }
+        rec.update(summarize(g))
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.merge(
+            total,
+            left_on="pitcher_id",
+            right_on="pitcher",
+            how="left",
+            suffixes=("", "_drop"),
+        )
+        out["pitch_mix_pct"] = (
+            pd.to_numeric(out["pitch_count"], errors="coerce")
+            / pd.to_numeric(out["total_pitches"], errors="coerce")
+        ).round(4)
+        out = out.drop(columns=[c for c in ["pitcher_drop"] if c in out.columns], errors="ignore")
+
+    return with_stamp(out, cfg, "Pitcher pitch mix and damage allowed by pitch type.")
+
+
+def bullpen_vulnerability(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    d = df[df["game_date_dt"] >= cfg.slate_date - timedelta(days=30)].copy()
+    if d.empty:
+        return with_stamp(pd.DataFrame(), cfg, "No rows.")
+
+    first_inning = (
+        d.groupby(["game_pk", "pitcher"])["inning"]
+        .min()
+        .reset_index()
+        .rename(columns={"inning": "first_inning"})
+    )
+    d = d.merge(first_inning, on=["game_pk", "pitcher"], how="left")
+
+    # Relief proxy: pitchers whose first inning was after the 1st, plus later-inning rows.
+    rel = d[(d["first_inning"] > 1) | (d["inning"] >= 5)]
+
+    rows = []
+    for team, g in rel.groupby("pitching_team", dropna=False):
+        if not str(team).strip():
+            continue
+
+        rec = {
+            "team": team,
+            "window_days": 30,
+            "relief_pitchers_seen": int(g["pitcher"].nunique()),
+        }
+        rec.update(summarize(g))
+        rows.append(rec)
+
+    return with_stamp(
+        pd.DataFrame(rows),
+        cfg,
+        "Bullpen HR vulnerability proxy from recent Statcast relief appearances.",
+    )
+
+
+def manifest(cfg: Config) -> pd.DataFrame:
+    base = cfg.raw_base_url.rstrip("/")
+
+    files = [
+        ("Statcast Rolling Windows", "statcast_batter_rolling.csv", "pull_timestamp", "TRUE"),
+        ("Pitcher Statcast Rolling", "statcast_pitcher_rolling.csv", "pull_timestamp", "TRUE"),
+        ("Pitch Type Batter Damage", "pitch_type_batter_damage.csv", "pull_timestamp", "TRUE"),
+        ("Pitch Type Pitcher Vulnerability", "pitch_type_pitcher_vulnerability.csv", "pull_timestamp", "TRUE"),
+        ("Bullpen HR Vulnerability", "bullpen_hr_vulnerability.csv", "pull_timestamp", "FALSE"),
     ]
 
-    id_col = "batter" if role == "batter" else "pitcher"
-
-    pa_rows = window[window["events"].notna()].copy()
-    bbe = window[window["launch_speed"].notna()].copy()
-
-    rows = []
-
-    for mlbam_id, group in pa_rows.groupby(id_col):
-        mlbam_id = int(mlbam_id)
-        people = people_map.get(mlbam_id, {})
-        bbe_group = bbe[bbe[id_col] == mlbam_id]
-
-        pa_or_bf = len(group)
-        batted_balls = len(bbe_group)
-        hr = int((group["events"] == "home_run").sum())
-
-        avg_ev = bbe_group["launch_speed"].mean() if batted_balls else ""
-        max_ev = bbe_group["launch_speed"].max() if batted_balls else ""
-
-        hard_hit_count = (
-            int((bbe_group["launch_speed"] >= 95).sum())
-            if batted_balls
-            else ""
-        )
-        hard_hit_pct = (
-            hard_hit_count / batted_balls
-            if batted_balls and hard_hit_count != ""
-            else ""
-        )
-
-        if "launch_speed_angle" in bbe_group.columns and batted_balls:
-            barrels = int((bbe_group["launch_speed_angle"] == 6).sum())
-        else:
-            barrels = ""
-
-        barrel_pct = (
-            barrels / batted_balls
-            if batted_balls and barrels != ""
-            else ""
-        )
-
-        barrel_per_pa = (
-            barrels / pa_or_bf
-            if pa_or_bf and barrels != ""
-            else ""
-        )
-
-        xwoba = (
-            bbe_group["estimated_woba_using_speedangle"].mean()
-            if "estimated_woba_using_speedangle" in bbe_group.columns and batted_balls
-            else ""
-        )
-
-        avg_launch_angle = (
-            bbe_group["launch_angle"].mean()
-            if batted_balls
-            else ""
-        )
-
-        fly_balls = (
-            int((bbe_group["bb_type"] == "fly_ball").sum())
-            if "bb_type" in bbe_group.columns and batted_balls
-            else 0
-        )
-
-        fb_pct = fly_balls / batted_balls if batted_balls else ""
-        hr_per_fb = hr / fly_balls if fly_balls else ""
-
-        rows.append({
-            "pull_timestamp": pull_ts,
-            "window_days": window_days,
-            "player_name": people.get("name", ""),
-            "team": people.get("team", ""),
-            "mlbam_id": mlbam_id,
-            "role": role,
-            "pa_or_bf": pa_or_bf,
-            "batted_balls": batted_balls,
-            "hr": hr,
-            "avg_ev": safe_number(avg_ev),
-            "max_ev": safe_number(max_ev),
-            "hard_hit_pct": safe_number(hard_hit_pct),
-            "barrels": barrels,
-            "barrel_pct": safe_number(barrel_pct),
-            "barrel_per_pa": safe_number(barrel_per_pa),
-            "xslg": "",
-            "xwoba": safe_number(xwoba),
-            "avg_launch_angle": safe_number(avg_launch_angle),
-            "fb_pct": safe_number(fb_pct),
-            "pull_pct": "",
-            "sample_quality": sample_quality(pa_or_bf, batted_balls),
-            "source": "pybaseball.statcast",
-            "notes": "Rolling Statcast sample; no FanGraphs dependency.",
-            "reserved_1": "",
-            "reserved_2": "",
-            "reserved_3": "",
-            "reserved_4": "",
-            "reserved_5": "",
-            "hr_per_fb": safe_number(hr_per_fb),
-        })
-
-    return rows
+    return pd.DataFrame(
+        [
+            {
+                "sheet_name": sheet,
+                "url": f"{base}/{filename}" if base else filename,
+                "date_column": date_col,
+                "required": required,
+                "import_mode": "replace",
+            }
+            for sheet, filename, date_col, required in files
+        ]
+    )
 
 
-def build_rolling_windows(df, people_map):
-    rows = []
+def run(cfg: Config) -> None:
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    for window_days in [7, 14, 30]:
-        rows.extend(aggregate_player_window(df, window_days, "batter", people_map))
-        rows.extend(aggregate_player_window(df, window_days, "pitcher", people_map))
+    raw = fetch_statcast_chunks(cfg)
+    df = prepare_statcast(raw)
 
-    rolling_df = pd.DataFrame(rows)
+    outputs = {
+        "statcast_batter_rolling.csv": batter_rolling(df, cfg),
+        "statcast_pitcher_rolling.csv": pitcher_rolling(df, cfg),
+        "pitch_type_batter_damage.csv": batter_pitch_type(df, cfg),
+        "pitch_type_pitcher_vulnerability.csv": pitcher_pitch_type(df, cfg),
+        "bullpen_hr_vulnerability.csv": bullpen_vulnerability(df, cfg),
+        "manifest.csv": manifest(cfg),
+    }
 
-    rolling_headers = [
-        "pull_timestamp",
-        "window_days",
-        "player_name",
-        "team",
-        "mlbam_id",
-        "role",
-        "pa_or_bf",
-        "batted_balls",
-        "hr",
-        "avg_ev",
-        "max_ev",
-        "hard_hit_pct",
-        "barrels",
-        "barrel_pct",
-        "barrel_per_pa",
-        "xslg",
-        "xwoba",
-        "avg_launch_angle",
-        "fb_pct",
-        "pull_pct",
-        "sample_quality",
-        "source",
-        "notes",
-        "reserved_1",
-        "reserved_2",
-        "reserved_3",
-        "reserved_4",
-        "reserved_5",
-        "hr_per_fb",
-    ]
+    summary = {
+        "slate_date": cfg.slate_date.isoformat(),
+        "generated_at": now_iso(cfg.timezone),
+        "lookback_days": cfg.lookback_days,
+        "windows": list(cfg.windows),
+        "outputs": {},
+    }
 
-    return rolling_df[rolling_headers]
+    for filename, out in outputs.items():
+        write_csv(out, cfg.output_dir / filename)
+        summary["outputs"][filename] = int(len(out))
+
+    with open(cfg.output_dir / "refresh_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(json.dumps(summary, indent=2), flush=True)
 
 
-def build_batter_daily_from_rolling(rolling_df):
-    batter_30 = rolling_df[
-        (rolling_df["role"] == "batter") &
-        (rolling_df["window_days"] == 30)
-    ].copy()
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date", default="today")
+    ap.add_argument("--timezone", default=os.getenv("RUN_DATE_TZ", "America/Toronto"))
+    ap.add_argument("--output-dir", default="data/exports")
+    ap.add_argument("--windows", default="7,14,30")
+    ap.add_argument("--lookback-days", type=int, default=35)
+    ap.add_argument("--raw-base-url", default=os.getenv("RAW_BASE_URL", ""))
+    args = ap.parse_args()
 
-    rows = []
-
-    for _, row in batter_30.iterrows():
-        rows.append({
-            "pull_timestamp": row["pull_timestamp"],
-            "season": SEASON,
-            "player_name": row["player_name"],
-            "team": row["team"],
-            "mlbam_id": row["mlbam_id"],
-            "pa": row["pa_or_bf"],
-            "batted_balls": row["batted_balls"],
-            "hr": row["hr"],
-            "xslg": "",
-            "xwoba": row["xwoba"],
-            "xba": "",
-            "avg_ev": row["avg_ev"],
-            "max_ev": row["max_ev"],
-            "hard_hit_pct": row["hard_hit_pct"],
-            "barrels": row["barrels"],
-            "barrel_pct": row["barrel_pct"],
-            "barrel_per_pa": row["barrel_per_pa"],
-            "avg_launch_angle": row["avg_launch_angle"],
-            "sweet_spot_pct": "",
-            "fb_pct": row["fb_pct"],
-            "pull_pct": "",
-            "hr_per_fb": row["hr_per_fb"],
-            "source": "pybaseball.statcast rolling_30",
-            "notes": "30-day Statcast rolling proxy; FanGraphs blocked on GitHub runner.",
-        })
-
-    return pd.DataFrame(rows)
-
-
-def build_pitcher_daily_from_rolling(rolling_df):
-    pitcher_30 = rolling_df[
-        (rolling_df["role"] == "pitcher") &
-        (rolling_df["window_days"] == 30)
-    ].copy()
-
-    rows = []
-
-    for _, row in pitcher_30.iterrows():
-        rows.append({
-            "pull_timestamp": row["pull_timestamp"],
-            "season": SEASON,
-            "player_name": row["player_name"],
-            "team": row["team"],
-            "mlbam_id": row["mlbam_id"],
-            "batters_faced": row["pa_or_bf"],
-            "batted_balls_allowed": row["batted_balls"],
-            "hr_allowed": row["hr"],
-            "xera": "",
-            "xslg_allowed": "",
-            "xwoba_allowed": row["xwoba"],
-            "avg_ev_allowed": row["avg_ev"],
-            "max_ev_allowed": row["max_ev"],
-            "hard_hit_pct_allowed": row["hard_hit_pct"],
-            "barrels_allowed": row["barrels"],
-            "barrel_pct_allowed": row["barrel_pct"],
-            "barrel_per_pa_allowed": row["barrel_per_pa"],
-            "avg_launch_angle_allowed": row["avg_launch_angle"],
-            "fb_pct_allowed": row["fb_pct"],
-            "pull_pct_allowed": "",
-            "hr_per_fb_allowed": row["hr_per_fb"],
-            "pitch_hand": "",
-            "source": "pybaseball.statcast rolling_30",
-            "notes": "30-day Statcast rolling proxy; FanGraphs blocked on GitHub runner.",
-        })
-
-    return pd.DataFrame(rows)
-
-
-def build_status_df(batter_df, pitcher_df, rolling_df):
-    return pd.DataFrame([{
-        "pull_timestamp": now_str(),
-        "season": SEASON,
-        "batter_rows": len(batter_df),
-        "pitcher_rows": len(pitcher_df),
-        "rolling_rows": len(rolling_df),
-        "status": "OK",
-        "notes": "Statcast-only pipeline completed. No Google Cloud. No FanGraphs.",
-    }])
-
-
-def main():
-    ensure_data_dir()
-
-    statcast_df = pull_statcast_30_days()
-
-    player_ids = set(statcast_df["batter"].dropna().astype(int).unique())
-    player_ids.update(set(statcast_df["pitcher"].dropna().astype(int).unique()))
-
-    print(f"Fetching MLB people metadata for {len(player_ids)} players...")
-    people_map = get_people_map(player_ids)
-
-    rolling_df = build_rolling_windows(statcast_df, people_map)
-    batter_df = build_batter_daily_from_rolling(rolling_df)
-    pitcher_df = build_pitcher_daily_from_rolling(rolling_df)
-    status_df = build_status_df(batter_df, pitcher_df, rolling_df)
-
-    write_csv("batter_statcast_daily.csv", batter_df)
-    write_csv("pitcher_statcast_daily.csv", pitcher_df)
-    write_csv("statcast_rolling_windows.csv", rolling_df)
-    write_csv("statcast_status.csv", status_df)
-
-    print("Statcast CSV refresh complete.")
+    cfg = Config(
+        slate_date=parse_date(args.date, args.timezone),
+        timezone=args.timezone,
+        output_dir=Path(args.output_dir),
+        raw_base_url=args.raw_base_url,
+        windows=tuple(int(x.strip()) for x in args.windows.split(",") if x.strip()),
+        lookback_days=args.lookback_days,
+    )
+    run(cfg)
 
 
 if __name__ == "__main__":
