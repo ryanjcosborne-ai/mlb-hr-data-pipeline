@@ -1,4 +1,4 @@
-pandas>=2.2.0
-numpy>=1.26.0
-requests>=2.31.0
-pybaseball>=2.2.7
+pandas>=2.2.0,<3.0.0
+numpy>=1.26.0,<2.4.0
+requests>=2.31.0,<3.0.0
+pybaseball==2.2.7
