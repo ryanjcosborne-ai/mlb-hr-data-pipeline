@@ -3,8 +3,11 @@ name: Daily MLB HR Statcast Refresh
 on:
   workflow_dispatch:
   schedule:
-    - cron: "37 6 * * *"
-      timezone: "America/Toronto"
+    # GitHub schedules are UTC. Run before the Apps Script morning windows
+    # and again midday so the sheet can recover automatically if the first run is delayed.
+    - cron: "15 10 * * *"
+    - cron: "30 12 * * *"
+    - cron: "45 15 * * *"
 
 permissions:
   contents: write
@@ -42,6 +45,34 @@ jobs:
             --timezone America/Toronto \
             --output-dir data \
             --raw-base-url "$RAW_BASE_URL"
+
+      - name: Validate same-day outputs
+        run: |
+          python - <<'PY'
+          import json
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          today = datetime.now(ZoneInfo('America/Toronto')).date().isoformat()
+          summary = json.loads(Path('data/refresh_summary.json').read_text())
+          if summary.get('slate_date') != today:
+              raise SystemExit(f"refresh_summary stale: {summary.get('slate_date')} != {today}")
+
+          required = {
+              'statcast_batter_rolling.csv': 500,
+              'statcast_pitcher_rolling.csv': 500,
+              'pitch_type_batter_damage.csv': 1000,
+              'pitch_type_pitcher_vulnerability.csv': 1000,
+          }
+          outputs = summary.get('outputs', {})
+          for name, min_rows in required.items():
+              rows = int(outputs.get(name, 0))
+              if rows < min_rows:
+                  raise SystemExit(f"{name} rows too low: {rows} < {min_rows}")
+
+          print(f"Validated same-day Statcast outputs for {today}")
+          PY
 
       - name: Commit refreshed CSV outputs
         run: |
