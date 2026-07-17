@@ -3,11 +3,20 @@ name: Daily MLB HR Statcast Refresh
 on:
   workflow_dispatch:
   schedule:
-    # GitHub schedules are UTC. Run before the Apps Script morning windows
-    # and again midday so the sheet can recover automatically if the first run is delayed.
-    - cron: "15 10 * * *"
-    - cron: "30 12 * * *"
-    - cron: "45 15 * * *"
+    # Use explicit Toronto time and off-peak minutes. Multiple attempts protect
+    # the daily card from normal GitHub Actions schedule delays.
+    - cron: "17 4 * * *"
+      timezone: "America/Toronto"
+    - cron: "47 5 * * *"
+      timezone: "America/Toronto"
+    - cron: "17 7 * * *"
+      timezone: "America/Toronto"
+    - cron: "47 8 * * *"
+      timezone: "America/Toronto"
+    - cron: "17 10 * * *"
+      timezone: "America/Toronto"
+    - cron: "47 11 * * *"
+      timezone: "America/Toronto"
 
 permissions:
   contents: write
