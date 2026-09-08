@@ -1,6 +1,6 @@
 {
-  "slate_date": "2026-09-07",
-  "generated_at": "2026-09-07T15:24:25-04:00",
+  "slate_date": "2026-09-08",
+  "generated_at": "2026-09-08T08:53:25-04:00",
   "lookback_days": 35,
   "windows": [
     7,
@@ -8,10 +8,10 @@
     30
   ],
   "outputs": {
-    "statcast_batter_rolling.csv": 1351,
-    "statcast_pitcher_rolling.csv": 1516,
-    "pitch_type_batter_damage.csv": 4744,
-    "pitch_type_pitcher_vulnerability.csv": 2507,
+    "statcast_batter_rolling.csv": 1349,
+    "statcast_pitcher_rolling.csv": 1511,
+    "pitch_type_batter_damage.csv": 4717,
+    "pitch_type_pitcher_vulnerability.csv": 2526,
     "bullpen_hr_vulnerability.csv": 30,
     "manifest.csv": 5
   }
